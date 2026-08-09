@@ -30,6 +30,32 @@ struct ActivitySegment: Identifiable, Equatable, Sendable {
     }
 }
 
+struct ActivityIntervalRecord: Equatable, Sendable {
+    let startAt: Date
+    let endAt: Date
+    let bundleID: String
+    let appName: String
+}
+
+struct ApplicationUsageSummary: Identifiable, Equatable, Sendable {
+    var id: String { bundleID }
+    let bundleID: String
+    let appName: String
+    let activeSeconds: TimeInterval
+}
+
+struct ActivityDaySummary: Identifiable, Equatable, Sendable {
+    var id: String { day }
+    let day: String
+    let startAt: Date
+    let activeSeconds: TimeInterval
+    let segmentCount: Int
+    let applications: [ApplicationUsageSummary]
+    let isToday: Bool
+
+    var applicationCount: Int { applications.count }
+}
+
 enum DiaryStatus: String, Codable, Sendable {
     case pending
     case succeeded
@@ -44,6 +70,48 @@ struct DiaryEntry: Identifiable, Equatable, Sendable {
     let model: String
     let generatedAt: Date?
     let errorCode: String?
+}
+
+enum DiaryDayState: Equatable, Sendable {
+    case recording
+    case ready
+    case generating
+    case failed
+    case succeeded
+    case activityExpired
+
+    var localizedName: String {
+        switch self {
+        case .recording: "记录中"
+        case .ready: "待生成"
+        case .generating: "生成中"
+        case .failed: "生成失败"
+        case .succeeded: "已生成"
+        case .activityExpired: "活动明细已过期"
+        }
+    }
+}
+
+struct DiaryDayRecord: Identifiable, Equatable, Sendable {
+    var id: String { day }
+    let day: String
+    let activity: ActivityDaySummary?
+    let diary: DiaryEntry?
+
+    var state: DiaryDayState {
+        guard let activity else { return .activityExpired }
+        if activity.isToday { return .recording }
+        switch diary?.status {
+        case .pending: return .generating
+        case .failed: return .failed
+        case .succeeded: return .succeeded
+        case nil: return .ready
+        }
+    }
+
+    var canGenerate: Bool {
+        activity != nil && activity?.isToday == false
+    }
 }
 
 struct AIConfiguration: Equatable, Sendable {
@@ -126,13 +194,26 @@ enum MicrocamDefaults {
 }
 
 enum DateCoding {
-    static func dayString(_ date: Date) -> String {
-        let components = Calendar.autoupdatingCurrent.dateComponents([.year, .month, .day], from: date)
+    static func dayString(_ date: Date, calendar: Calendar = .autoupdatingCurrent) -> String {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
         return String(
             format: "%04d-%02d-%02d",
             components.year ?? 0,
             components.month ?? 0,
             components.day ?? 0
         )
+    }
+
+    static func date(fromDay day: String, calendar: Calendar = .autoupdatingCurrent) -> Date? {
+        let parts = day.split(separator: "-", omittingEmptySubsequences: false)
+        guard
+            parts.count == 3,
+            let year = Int(parts[0]),
+            let month = Int(parts[1]),
+            let dayOfMonth = Int(parts[2]),
+            let date = calendar.date(from: DateComponents(year: year, month: month, day: dayOfMonth)),
+            dayString(date, calendar: calendar) == day
+        else { return nil }
+        return date
     }
 }

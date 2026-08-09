@@ -204,9 +204,7 @@ struct ActivityRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "app.dashed")
-                .frame(width: 28, height: 28)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+            AppIconView(bundleID: segment.bundleID, size: 32)
             VStack(alignment: .leading, spacing: 3) {
                 Text(segment.appName).fontWeight(.medium)
                 Text(segment.sanitizedTitle ?? policyDescription)
