@@ -10,7 +10,12 @@ struct MicrocamApp: App {
         MenuBarExtra {
             MenuBarContent(model: model)
         } label: {
-            Label("Microcam", systemImage: model.monitor.displayState.symbolName)
+            Image("MenuBarIcon")
+                .resizable()
+                .renderingMode(.template)
+                .interpolation(.high)
+                .frame(width: 18, height: 18)
+                .accessibilityLabel(model.monitor.displayState.title)
         }
         .menuBarExtraStyle(.menu)
 
