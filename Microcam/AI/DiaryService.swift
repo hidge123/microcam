@@ -4,6 +4,8 @@ enum DiaryServiceError: LocalizedError {
     case noActivity
     case notConfigured
     case alreadyExists
+    case invalidDay
+    case incompleteDay
     case underlying(Error)
 
     var errorDescription: String? {
@@ -11,6 +13,8 @@ enum DiaryServiceError: LocalizedError {
         case .noActivity: "当天没有可用于生成日记的活动"
         case .notConfigured: "请先完成 AI 接口配置"
         case .alreadyExists: "当天日记已经存在"
+        case .invalidDay: "活动日志日期无效"
+        case .incompleteDay: "今天的活动日志仍在记录中，需在当天结束后生成"
         case let .underlying(error): error.localizedDescription
         }
     }
@@ -28,22 +32,27 @@ actor DiaryService {
     }
 
     func generate(
-        for date: Date,
+        forDay day: String,
         configuration: AIConfiguration,
         promptTemplate: String,
         replacingExisting: Bool
     ) async throws -> DiaryEntry {
         guard configuration.isConfigured else { throw DiaryServiceError.notConfigured }
-        let day = DateCoding.dayString(date)
+        guard let date = DateCoding.date(fromDay: day, calendar: calendar) else {
+            throw DiaryServiceError.invalidDay
+        }
+        guard date < calendar.startOfDay(for: Date()) else {
+            throw DiaryServiceError.incompleteDay
+        }
         let existing = try await store.diary(for: day)
         if existing?.status == .succeeded && !replacingExisting {
             throw DiaryServiceError.alreadyExists
         }
 
-        let start = calendar.startOfDay(for: date)
-        let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86_400)
-        let segments = try await store.fetchSegments(from: start, to: end)
-        guard !segments.isEmpty else { throw DiaryServiceError.noActivity }
+        let segments = try await store.fetchSegments(forDay: day, calendar: calendar)
+        guard segments.contains(where: { $0.activeSeconds > 0 }) else {
+            throw DiaryServiceError.noActivity
+        }
         let payload = DiaryAggregator.aggregate(segments: segments, date: date, calendar: calendar)
         let renderedPrompt = try PromptRenderer.render(template: promptTemplate, payload: payload)
 

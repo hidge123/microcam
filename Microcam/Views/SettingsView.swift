@@ -171,6 +171,43 @@ private struct PrivacySettings: View {
                 }
 
                 Section {
+                    if model.knownApplications.isEmpty {
+                        Text("记录到应用后，可在这里逐个设置标题采集、仅记录时长或完全排除。")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.knownApplications, id: \.bundleID) { application in
+                            HStack(spacing: 16) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(application.name).fontWeight(.medium)
+                                    if application.name != application.bundleID {
+                                        Text(application.bundleID)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Picker("采集策略", selection: Binding(
+                                    get: { settings.policy(for: application.bundleID) },
+                                    set: { settings.setPolicy($0, for: application.bundleID) }
+                                )) {
+                                    ForEach(AppCapturePolicy.allCases) { policy in
+                                        Text(policy.localizedName).tag(policy)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(width: 150)
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                } header: {
+                    SettingsSectionHeader(
+                        title: "应用采集策略",
+                        help: "“应用与标题”记录应用时长及本地脱敏后的窗口标题；“仅记录时长”不读取或保存标题；“完全排除”不会生成该应用的活动段。密码管理器、系统密码和钥匙串默认仅记录时长。"
+                    )
+                }
+
+                Section {
                     Text("敏感词（每行一个，按普通文本匹配）")
                     TextEditor(text: $sensitiveTerms).font(.system(.body, design: .monospaced)).frame(minHeight: 80)
                     Text("自定义正则（每行一个）")

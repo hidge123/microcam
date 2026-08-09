@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 import Testing
 @testable import Microcam
 
@@ -55,5 +56,141 @@ import Testing
         _ = try SQLiteStore(cryptoBox: .ephemeral(), databaseURL: databaseURL)
         let attributes = try FileManager.default.attributesOfItem(atPath: databaseURL.path)
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+    }
+
+    @Test func dailySummaryDoesNotReadEncryptedTitles() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("microcam-summary-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("test.sqlite")
+        let store = try SQLiteStore(cryptoBox: .ephemeral(), databaseURL: databaseURL)
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-08T10:00:00+08:00"))
+
+        try await store.save(ActivitySegment(
+            id: UUID(),
+            startAt: now,
+            endAt: now.addingTimeInterval(15 * 60),
+            bundleID: "com.example.editor",
+            appName: "Editor",
+            sanitizedTitle: "encrypted title",
+            capturePolicy: .title
+        ))
+
+        var database: OpaquePointer?
+        #expect(sqlite3_open_v2(databaseURL.path, &database, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+        #expect(sqlite3_exec(
+            database,
+            "UPDATE activity_segments SET title_ciphertext = X'00';",
+            nil,
+            nil,
+            nil
+        ) == SQLITE_OK)
+        sqlite3_close(database)
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "Asia/Shanghai"))
+        let summaries = try await store.fetchActivityDaySummaries(calendar: calendar, now: now)
+        #expect(summaries.count == 1)
+        #expect(summaries.first?.activeSeconds == 900.0)
+
+        do {
+            _ = try await store.fetchSegments(forDay: "2026-08-08", calendar: calendar)
+            Issue.record("Expected detailed loading to decrypt the corrupt title")
+        } catch let error as SQLiteStoreError {
+            guard case .corruptedEncryptedField = error else {
+                Issue.record("Unexpected store error: \(error)")
+                return
+            }
+        }
+    }
+
+    @Test func deletingOneDayPreservesAdjacentActivityAndDiary() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("microcam-day-delete-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try SQLiteStore(
+            cryptoBox: .ephemeral(),
+            databaseURL: directory.appendingPathComponent("test.sqlite")
+        )
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "Asia/Shanghai"))
+        let crossMidnight = try #require(ISO8601DateFormatter().date(from: "2026-08-08T23:50:00+08:00"))
+        let nextMorning = try #require(ISO8601DateFormatter().date(from: "2026-08-09T09:00:00+08:00"))
+
+        try await store.save(ActivitySegment(
+            id: UUID(),
+            startAt: crossMidnight,
+            endAt: crossMidnight.addingTimeInterval(20 * 60),
+            bundleID: "com.example.editor",
+            appName: "Editor",
+            sanitizedTitle: "Project",
+            capturePolicy: .title
+        ))
+        try await store.save(ActivitySegment(
+            id: UUID(),
+            startAt: nextMorning,
+            endAt: nextMorning.addingTimeInterval(10 * 60),
+            bundleID: "com.example.browser",
+            appName: "Browser",
+            sanitizedTitle: nil,
+            capturePolicy: .durationOnly
+        ))
+        try await store.save(DiaryEntry(
+            day: "2026-08-08",
+            status: .succeeded,
+            content: "保留的日记",
+            model: "test",
+            generatedAt: nextMorning,
+            errorCode: nil
+        ))
+
+        try await store.deleteActivities(forDay: "2026-08-08", calendar: calendar)
+
+        #expect(try await store.fetchSegments(forDay: "2026-08-08", calendar: calendar).isEmpty)
+        let nextDay = try await store.fetchSegments(forDay: "2026-08-09", calendar: calendar)
+        #expect(nextDay.count == 2)
+        #expect(nextDay.reduce(0) { $0 + $1.activeSeconds } == 20 * 60)
+        #expect(try await store.diary(for: "2026-08-08")?.content == "保留的日记")
+
+        try await store.deleteDiary(for: "2026-08-08")
+        #expect(try await store.diary(for: "2026-08-08") == nil)
+        #expect(try await store.fetchSegments(forDay: "2026-08-09", calendar: calendar).count == 2)
+    }
+
+    @Test func retentionCleanupKeepsPermanentDiary() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("microcam-retention-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try SQLiteStore(
+            cryptoBox: .ephemeral(),
+            databaseURL: directory.appendingPathComponent("test.sqlite")
+        )
+        let oldDate = try #require(ISO8601DateFormatter().date(from: "2026-07-01T09:00:00+08:00"))
+        let cutoff = try #require(ISO8601DateFormatter().date(from: "2026-08-01T00:00:00+08:00"))
+        try await store.save(ActivitySegment(
+            id: UUID(),
+            startAt: oldDate,
+            endAt: oldDate.addingTimeInterval(60),
+            bundleID: "com.example.editor",
+            appName: "Editor",
+            sanitizedTitle: nil,
+            capturePolicy: .durationOnly
+        ))
+        try await store.save(DiaryEntry(
+            day: "2026-07-01",
+            status: .succeeded,
+            content: "永久保留",
+            model: "test",
+            generatedAt: oldDate,
+            errorCode: nil
+        ))
+
+        try await store.deleteActivities(olderThan: cutoff)
+
+        #expect(try await store.fetchSegments(from: oldDate, to: cutoff).isEmpty)
+        #expect(try await store.diary(for: "2026-07-01")?.content == "永久保留")
     }
 }

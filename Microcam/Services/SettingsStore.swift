@@ -20,6 +20,7 @@ final class SettingsStore: ObservableObject {
         static let policies = "capturePolicies"
         static let onboardingComplete = "onboardingComplete"
         static let lastAutoAttemptDay = "lastAutoAttemptDay"
+        static let autoAttemptedDays = "autoAttemptedDays"
     }
 
     private let defaults: UserDefaults
@@ -168,7 +169,6 @@ final class SettingsStore: ObservableObject {
         } else {
             try KeychainStore.set(apiKey, for: .apiKey)
         }
-        defaults.removeObject(forKey: Key.lastAutoAttemptDay)
     }
 
     func saveRedactionSecrets() throws {
@@ -185,11 +185,16 @@ final class SettingsStore: ObservableObject {
     }
 
     func markAutoAttempt(for day: String) {
+        var days = Set(defaults.stringArray(forKey: Key.autoAttemptedDays) ?? [])
+        days.insert(day)
+        defaults.set(days.sorted(), forKey: Key.autoAttemptedDays)
+        // Keep writing the legacy value so downgrading does not immediately retry.
         defaults.set(day, forKey: Key.lastAutoAttemptDay)
     }
 
     func hasAutoAttempted(day: String) -> Bool {
-        defaults.string(forKey: Key.lastAutoAttemptDay) == day
+        defaults.stringArray(forKey: Key.autoAttemptedDays)?.contains(day) == true ||
+            defaults.string(forKey: Key.lastAutoAttemptDay) == day
     }
 
     func restoreDefaults() {
@@ -212,6 +217,7 @@ final class SettingsStore: ObservableObject {
         onboardingComplete = false
         defaults.removeObject(forKey: Key.policies)
         defaults.removeObject(forKey: Key.lastAutoAttemptDay)
+        defaults.removeObject(forKey: Key.autoAttemptedDays)
     }
 
     private func persistPolicies() {

@@ -142,6 +142,61 @@ actor SQLiteStore {
         return segments
     }
 
+    func fetchActivityDaySummaries(
+        calendar: Calendar = .autoupdatingCurrent,
+        now: Date = Date()
+    ) throws -> [ActivityDaySummary] {
+        // Keep this query deliberately free of title_ciphertext. Daily list rendering
+        // must never decrypt or otherwise touch window titles.
+        let statement = try prepare("""
+        SELECT start_at, end_at, bundle_id, app_name
+        FROM activity_segments
+        WHERE end_at > start_at
+        ORDER BY start_at ASC;
+        """)
+        defer { sqlite3_finalize(statement) }
+
+        var records: [ActivityIntervalRecord] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard
+                let bundleID = columnString(statement, 2),
+                let appName = columnString(statement, 3)
+            else { continue }
+            records.append(ActivityIntervalRecord(
+                startAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 0)),
+                endAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                bundleID: bundleID,
+                appName: appName
+            ))
+        }
+        return ActivityDayAggregator.summarize(records, calendar: calendar, now: now)
+    }
+
+    func fetchSegments(
+        forDay day: String,
+        calendar: Calendar = .autoupdatingCurrent
+    ) throws -> [ActivitySegment] {
+        guard
+            let start = DateCoding.date(fromDay: day, calendar: calendar),
+            let interval = calendar.dateInterval(of: .day, for: start)
+        else { return [] }
+
+        return try fetchSegments(from: interval.start, to: interval.end).compactMap { segment in
+            let clippedStart = max(segment.startAt, interval.start)
+            let clippedEnd = min(segment.endAt, interval.end)
+            guard clippedEnd > clippedStart else { return nil }
+            return ActivitySegment(
+                id: segment.id,
+                startAt: clippedStart,
+                endAt: clippedEnd,
+                bundleID: segment.bundleID,
+                appName: segment.appName,
+                sanitizedTitle: segment.sanitizedTitle,
+                capturePolicy: segment.capturePolicy
+            )
+        }
+    }
+
     func save(_ diary: DiaryEntry) throws {
         let sql = """
         INSERT INTO diary_entries (day, status, content_ciphertext, model, generated_at, error_code)
@@ -190,6 +245,73 @@ actor SQLiteStore {
         bind(day, to: 1, in: statement)
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
         return try decodeDiary(statement)
+    }
+
+    func deleteActivities(
+        forDay day: String,
+        calendar: Calendar = .autoupdatingCurrent
+    ) throws {
+        guard
+            let date = DateCoding.date(fromDay: day, calendar: calendar),
+            let interval = calendar.dateInterval(of: .day, for: date)
+        else { return }
+
+        // Preserve portions of any legacy segment that crosses this day's boundary.
+        // Current monitoring normally closes segments at midnight, but this also keeps
+        // deletion safe for databases created by older builds.
+        let overlapping = try fetchSegments(from: interval.start, to: interval.end)
+        guard !overlapping.isEmpty else { return }
+
+        try execute("BEGIN IMMEDIATE;")
+        do {
+            let statement = try prepare("DELETE FROM activity_segments WHERE end_at > ? AND start_at < ?;")
+            sqlite3_bind_double(statement, 1, interval.start.timeIntervalSince1970)
+            sqlite3_bind_double(statement, 2, interval.end.timeIntervalSince1970)
+            do {
+                try step(statement)
+                sqlite3_finalize(statement)
+            } catch {
+                sqlite3_finalize(statement)
+                throw error
+            }
+
+            for segment in overlapping {
+                let hasLeadingPart = segment.startAt < interval.start
+                if hasLeadingPart {
+                    try save(ActivitySegment(
+                        id: segment.id,
+                        startAt: segment.startAt,
+                        endAt: interval.start,
+                        bundleID: segment.bundleID,
+                        appName: segment.appName,
+                        sanitizedTitle: segment.sanitizedTitle,
+                        capturePolicy: segment.capturePolicy
+                    ))
+                }
+                if segment.endAt > interval.end {
+                    try save(ActivitySegment(
+                        id: hasLeadingPart ? UUID() : segment.id,
+                        startAt: interval.end,
+                        endAt: segment.endAt,
+                        bundleID: segment.bundleID,
+                        appName: segment.appName,
+                        sanitizedTitle: segment.sanitizedTitle,
+                        capturePolicy: segment.capturePolicy
+                    ))
+                }
+            }
+            try execute("COMMIT;")
+        } catch {
+            try? execute("ROLLBACK;")
+            throw error
+        }
+    }
+
+    func deleteDiary(for day: String) throws {
+        let statement = try prepare("DELETE FROM diary_entries WHERE day = ?;")
+        defer { sqlite3_finalize(statement) }
+        bind(day, to: 1, in: statement)
+        try step(statement)
     }
 
     func deleteActivities(olderThan cutoff: Date? = nil) throws {
