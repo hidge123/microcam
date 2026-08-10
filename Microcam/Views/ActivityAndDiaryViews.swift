@@ -7,8 +7,13 @@ struct ActivityView: View {
     @State private var selectedDay: String?
     @State private var selectedSegments: [ActivitySegment] = []
     @State private var isLoadingDetails = false
+    @State private var isLoadingMore = false
+    @State private var nextSegmentOffset = 0
+    @State private var hasMoreSegments = false
     @State private var showingDeleteAllConfirmation = false
     @State private var showingDeleteDayConfirmation = false
+
+    private let timelinePageSize = 50
 
     init(model: AppModel) {
         self.model = model
@@ -39,18 +44,12 @@ struct ActivityView: View {
         .task {
             await model.refreshActivityData()
             selectDayIfNeeded()
-            await loadSelectedDay()
+        }
+        .task(id: selectedDay) {
+            await loadSelectedDay(reset: true)
         }
         .onChange(of: model.activityDays.map(\.day)) {
             selectDayIfNeeded()
-        }
-        .onChange(of: selectedDay) {
-            Task { await loadSelectedDay() }
-        }
-        .onChange(of: model.lastRefresh) {
-            if selectedSummary?.isToday == true {
-                Task { await loadSelectedDay() }
-            }
         }
         .alert("删除全部活动记录？", isPresented: $showingDeleteAllConfirmation) {
             Button("取消", role: .cancel) {}
@@ -78,7 +77,12 @@ struct ActivityView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("刷新") { Task { await model.refreshActivityData() } }
+                Button("刷新") {
+                    Task {
+                        await model.refreshActivityData()
+                        await loadSelectedDay(reset: true)
+                    }
+                }
                 Button("删除全部", role: .destructive) { showingDeleteAllConfirmation = true }
             }
             captureStatus
@@ -154,7 +158,15 @@ struct ActivityView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("详细时间线").font(.title2.bold())
+                        HStack {
+                            Text("详细时间线").font(.title2.bold())
+                            Spacer()
+                            if !selectedSegments.isEmpty {
+                                Text("已显示最新 \(selectedSegments.count) 条")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                         if isLoadingDetails {
                             ProgressView("正在读取脱敏活动明细…")
                                 .frame(maxWidth: .infinity, minHeight: 140)
@@ -162,14 +174,28 @@ struct ActivityView: View {
                             ContentUnavailableView("没有可显示的活动明细", systemImage: "clock")
                                 .frame(maxWidth: .infinity, minHeight: 160)
                         } else {
-                            VStack(spacing: 0) {
-                                ForEach(selectedSegments.reversed()) { segment in
+                            LazyVStack(spacing: 0) {
+                                ForEach(selectedSegments) { segment in
                                     ActivityRow(segment: segment)
-                                    if segment.id != selectedSegments.first?.id { Divider() }
+                                    if segment.id != selectedSegments.last?.id { Divider() }
                                 }
                             }
                             .padding(.horizontal, 16)
                             .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
+
+                            if hasMoreSegments {
+                                Button {
+                                    Task { await loadSelectedDay(reset: false) }
+                                } label: {
+                                    if isLoadingMore {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Text("再加载 \(timelinePageSize) 条")
+                                    }
+                                }
+                                .disabled(isLoadingMore)
+                                .frame(maxWidth: .infinity)
+                            }
                         }
                     }
                 }
@@ -212,17 +238,46 @@ struct ActivityView: View {
         }
     }
 
-    private func loadSelectedDay() async {
-        guard let selectedDay else {
+    private func loadSelectedDay(reset: Bool) async {
+        guard let requestedDay = selectedDay else {
             selectedSegments = []
+            nextSegmentOffset = 0
+            hasMoreSegments = false
             return
         }
-        isLoadingDetails = true
-        defer { isLoadingDetails = false }
-        do {
-            selectedSegments = try await model.activitySegments(forDay: selectedDay)
-        } catch {
+        if reset {
+            isLoadingDetails = true
             selectedSegments = []
+            nextSegmentOffset = 0
+            hasMoreSegments = false
+        } else {
+            guard hasMoreSegments, !isLoadingMore else { return }
+            isLoadingMore = true
+        }
+        let offset = reset ? 0 : nextSegmentOffset
+        defer {
+            if selectedDay == requestedDay {
+                isLoadingDetails = false
+                isLoadingMore = false
+            }
+        }
+        do {
+            let page = try await model.activitySegmentPage(
+                forDay: requestedDay,
+                offset: offset,
+                limit: timelinePageSize
+            )
+            guard !Task.isCancelled, selectedDay == requestedDay else { return }
+            if reset {
+                selectedSegments = page.segments
+            } else {
+                selectedSegments.append(contentsOf: page.segments)
+            }
+            nextSegmentOffset = page.nextOffset
+            hasMoreSegments = page.hasMore
+        } catch {
+            guard selectedDay == requestedDay else { return }
+            if reset { selectedSegments = [] }
         }
     }
 }

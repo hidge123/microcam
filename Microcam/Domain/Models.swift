@@ -30,6 +30,12 @@ struct ActivitySegment: Identifiable, Equatable, Sendable {
     }
 }
 
+struct ActivitySegmentPage: Equatable, Sendable {
+    let segments: [ActivitySegment]
+    let nextOffset: Int
+    let hasMore: Bool
+}
+
 struct ActivityIntervalRecord: Equatable, Sendable {
     let startAt: Date
     let endAt: Date

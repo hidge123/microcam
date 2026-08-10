@@ -11,17 +11,11 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
 }
 
 struct SettingsView: View {
-    @ObservedObject var model: AppModel
-    @ObservedObject private var settings: SettingsStore
-    @ObservedObject private var monitor: ActivityMonitor
-    @ObservedObject private var loginItemManager: LoginItemManager
+    let model: AppModel
     @State private var page: SettingsPage = .general
 
     init(model: AppModel) {
         self.model = model
-        settings = model.settings
-        monitor = model.monitor
-        loginItemManager = model.loginItemManager
     }
 
     var body: some View {
@@ -353,12 +347,28 @@ private struct AISettings: View {
 }
 
 private struct PromptSettings: View {
-    @ObservedObject var model: AppModel
-    @ObservedObject private var settings: SettingsStore
+    let model: AppModel
+    @State private var promptDraft: String
+    @State private var savedTemplate: String
+    @State private var previewText: String?
+    @State private var previewedTemplate: String?
+    @State private var previewError: String?
+    @State private var isGeneratingPreview = false
 
     init(model: AppModel) {
         self.model = model
-        settings = model.settings
+        let template = model.settings.promptTemplate
+        _promptDraft = State(initialValue: template)
+        _savedTemplate = State(initialValue: template)
+        _previewText = State(initialValue: nil)
+        _previewedTemplate = State(initialValue: nil)
+        _previewError = State(initialValue: nil)
+    }
+
+    private var validationMessage: String? {
+        promptDraft.contains("{{activity_summary}}")
+            ? nil
+            : "提示词必须包含 {{activity_summary}}"
     }
 
     var body: some View {
@@ -371,16 +381,25 @@ private struct PromptSettings: View {
                         text: "支持 {{date}}、{{active_time}}、{{app_breakdown}} 和 {{activity_summary}}。其中 {{activity_summary}} 是必需项；它会被替换为脱敏后的活动摘要。"
                     )
                     Spacer()
+                    Button("保存") {
+                        model.savePromptTemplate(promptDraft)
+                        savedTemplate = promptDraft
+                    }
+                    .disabled(promptDraft == savedTemplate || validationMessage != nil)
                     Button("恢复默认") {
-                        settings.resetPrompt()
-                        model.refreshPromptPreview()
+                        model.settings.resetPrompt()
+                        let template = model.settings.promptTemplate
+                        promptDraft = template
+                        savedTemplate = template
+                        clearPreview()
                     }
                 }
-                TextEditor(text: $settings.promptTemplate)
+                TextEditor(text: $promptDraft)
                     .font(.system(.body, design: .monospaced))
                     .padding(8)
+                    .frame(minHeight: 320, maxHeight: .infinity)
                     .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
-                if let error = settings.promptValidationMessage {
+                if let error = validationMessage {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                 }
@@ -388,19 +407,108 @@ private struct PromptSettings: View {
             .frame(maxWidth: .infinity)
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("今日数据预览").font(.headline)
-                ScrollView {
-                    Text(model.promptPreview)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                HStack {
+                    Text("今日数据预览").font(.headline)
+                    if previewedTemplate != nil, previewedTemplate != promptDraft {
+                        Text("需要更新")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(isGeneratingPreview ? "生成中…" : "生成预览") {
+                        let template = promptDraft
+                        Task {
+                            isGeneratingPreview = true
+                            defer { isGeneratingPreview = false }
+                            do {
+                                let rendered = try await model.renderPromptPreview(template: template)
+                                guard promptDraft == template else { return }
+                                previewText = rendered
+                                previewedTemplate = template
+                                previewError = nil
+                            } catch {
+                                guard promptDraft == template else { return }
+                                previewText = nil
+                                previewedTemplate = template
+                                previewError = error.localizedDescription
+                            }
+                        }
+                    }
+                    .disabled(isGeneratingPreview || validationMessage != nil)
                 }
-                .padding(12)
+                Group {
+                    if previewedTemplate == promptDraft, let previewText {
+                        PromptPreviewTextView(text: previewText)
+                    } else if previewedTemplate == promptDraft, let previewError {
+                        ContentUnavailableView(
+                            "无法生成预览",
+                            systemImage: "exclamationmark.triangle",
+                            description: Text(previewError)
+                        )
+                    } else {
+                        ContentUnavailableView(
+                            previewedTemplate == nil ? "尚未生成预览" : "提示词已修改",
+                            systemImage: "doc.text.magnifyingglass",
+                            description: Text("点击“生成预览”后才会按需读取今日活动。编辑期间不会处理日志。")
+                        )
+                    }
+                }
+                .frame(minHeight: 320, maxHeight: .infinity)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
             }
             .frame(maxWidth: .infinity)
         }
-        .onChange(of: settings.promptTemplate) { _, _ in model.refreshPromptPreview() }
+        .onChange(of: promptDraft) { _, newValue in
+            guard previewedTemplate != newValue,
+                  previewText != nil || previewError != nil
+            else { return }
+            previewText = nil
+            previewError = nil
+        }
+    }
+
+    private func clearPreview() {
+        previewText = nil
+        previewedTemplate = nil
+        previewError = nil
+    }
+}
+
+private struct PromptPreviewTextView: NSViewRepresentable {
+    let text: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        textView.textContainerInset = NSSize(width: 10, height: 10)
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: 0,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView,
+              textView.string != text
+        else { return }
+        textView.string = text
     }
 }
 

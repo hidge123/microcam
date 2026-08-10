@@ -8,7 +8,7 @@ import Foundation
 final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
     @Published private(set) var displayState: MonitorDisplayState = .stopped
     @Published private(set) var accessibilityGranted = AXIsProcessTrusted()
-    @Published private(set) var currentSegment: ActivitySegment?
+    private(set) var currentSegment: ActivitySegment?
     @Published private(set) var pauseUntil: Date?
     @Published private(set) var lastRecordedAt: Date?
     @Published private(set) var lastPersistenceError: String?
@@ -20,11 +20,14 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
 
     var onDidPersist: (@MainActor () -> Void)?
     var onWake: (@MainActor () -> Void)?
+    var onPeriodicMaintenance: (@MainActor () -> Void)?
 
     private let settings: SettingsStore
     private let store: SQLiteStore
     private var timer: Timer?
     private var accessibilityRefreshTask: Task<Void, Never>?
+    private var lastAccessibilityCheck = Date.distantPast
+    private var lastTitleFallbackCheck = Date.distantPast
     private var isStarted = false
     private var sessionSuspended = false
     private var manuallyPaused = false
@@ -45,12 +48,15 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
         isStarted = true
         installWorkspaceObservers()
 
-        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+        // Application switches and window-title changes are event driven. This timer is
+        // only a low-frequency safety net for idle detection, midnight splitting and
+        // crash-recovery checkpoints.
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.tick()
             }
         }
-        timer.tolerance = 5
+        timer.tolerance = 15
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
 
@@ -68,14 +74,14 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
         removeWorkspaceObservers()
         removeAccessibilityObserver()
         await closeCurrent(at: Date())
-        displayState = .stopped
+        setDisplayState(.stopped)
     }
 
     func pause(for interval: TimeInterval?) async {
         manuallyPaused = interval == nil
         pauseUntil = interval.map { Date().addingTimeInterval($0) }
         await closeCurrent(at: Date())
-        displayState = .paused(until: pauseUntil)
+        setDisplayState(.paused(until: pauseUntil))
     }
 
     func resume() async {
@@ -111,41 +117,56 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     func refreshAccessibilityStatus() async {
+        lastAccessibilityCheck = Date()
         let newValue = AXIsProcessTrusted()
         guard newValue != accessibilityGranted else { return }
         accessibilityGranted = newValue
         await evaluateCurrentActivity(forceTransition: true)
     }
 
-    fileprivate func accessibilityEventReceived() async {
+    fileprivate func accessibilityEventReceived(focusedWindowChanged: Bool) async {
         guard isStarted else { return }
-        configureAccessibilityObserver(for: NSWorkspace.shared.frontmostApplication, force: true)
+        if focusedWindowChanged {
+            configureAccessibilityObserver(for: NSWorkspace.shared.frontmostApplication, force: true)
+        }
         await evaluateCurrentActivity(forceTransition: false)
     }
 
     private func tick() async {
         guard isStarted else { return }
+        let now = Date()
 
-        if let pauseUntil, Date() >= pauseUntil {
+        if let pauseUntil, now >= pauseUntil {
             self.pauseUntil = nil
         }
-        await refreshAccessibilityStatus()
-        await evaluateCurrentActivity(forceTransition: false)
-        onWake?()
+        if now.timeIntervalSince(lastAccessibilityCheck) >= 300 {
+            lastAccessibilityCheck = now
+            await refreshAccessibilityStatus()
+        }
+        let shouldRefreshTitle = now.timeIntervalSince(lastTitleFallbackCheck) >= 300
+        if shouldRefreshTitle { lastTitleFallbackCheck = now }
+        await evaluateCurrentActivity(
+            forceTransition: false,
+            refreshWindowTitle: shouldRefreshTitle
+        )
+        onPeriodicMaintenance?()
     }
 
-    private func evaluateCurrentActivity(forceTransition: Bool) async {
+    private func evaluateCurrentActivity(
+        forceTransition: Bool,
+        refreshWindowTitle: Bool = true
+    ) async {
         let now = Date()
 
         guard settings.recordingEnabled else {
             await closeCurrent(at: now)
-            displayState = .stopped
+            setDisplayState(.stopped)
             return
         }
         guard !sessionSuspended else { return }
         if manuallyPaused || pauseUntil != nil {
             await closeCurrent(at: now)
-            displayState = .paused(until: pauseUntil)
+            setDisplayState(.paused(until: pauseUntil))
             return
         }
 
@@ -160,13 +181,13 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
         if idleSeconds >= threshold {
             let idleBoundary = now.addingTimeInterval(-(idleSeconds - threshold))
             await closeCurrent(at: idleBoundary)
-            displayState = .idle
+            setDisplayState(.idle)
             return
         }
 
         guard let application = NSWorkspace.shared.frontmostApplication else {
             await closeCurrent(at: now)
-            displayState = .idle
+            setDisplayState(.idle)
             return
         }
         let bundleID = application.bundleIdentifier ?? "pid.\(application.processIdentifier)"
@@ -175,7 +196,7 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
 
         if requestedPolicy == .exclude {
             await closeCurrent(at: now)
-            displayState = .recording(appName: "已排除 \(appName)")
+            setDisplayState(.recording(appName: "已排除 \(appName)"))
             removeAccessibilityObserver()
             return
         }
@@ -191,9 +212,18 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         // The raw title is scoped to this expression and is never persisted or logged.
-        let sanitizedTitle = effectivePolicy == .title
-            ? settings.redactor.redact(readFocusedWindowTitle(for: application))
-            : nil
+        let canReuseCurrentTitle = !refreshWindowTitle
+            && currentSegment?.bundleID == bundleID
+            && currentSegment?.capturePolicy == effectivePolicy
+        let sanitizedTitle: String?
+        if effectivePolicy != .title {
+            sanitizedTitle = nil
+        } else if canReuseCurrentTitle {
+            sanitizedTitle = currentSegment?.sanitizedTitle
+        } else {
+            lastTitleFallbackCheck = now
+            sanitizedTitle = settings.redactor.redact(readFocusedWindowTitle(for: application))
+        }
 
         let changed = forceTransition ||
             currentSegment?.bundleID != bundleID ||
@@ -219,20 +249,21 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
         if let currentSegment {
             do {
                 try await store.save(currentSegment)
-                lastRecordedAt = now
-                lastPersistenceError = nil
+                markPersistenceSucceeded(at: now)
                 onDidPersist?()
             } catch {
                 // No private values are included in user-facing or system logs.
-                lastPersistenceError = error.localizedDescription
-                displayState = .stopped
+                setPersistenceError(error.localizedDescription)
+                setDisplayState(.stopped)
                 return
             }
         }
 
-        displayState = requestedPolicy == .title && !accessibilityGranted
-            ? .permissionLimited
-            : .recording(appName: appName)
+        setDisplayState(
+            requestedPolicy == .title && !accessibilityGranted
+                ? .permissionLimited
+                : .recording(appName: appName)
+        )
     }
 
     private func closeCurrent(at requestedEnd: Date) async {
@@ -243,13 +274,29 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
         guard segment.activeSeconds > 0 else { return }
         do {
             try await store.save(segment)
-            lastRecordedAt = Date()
-            lastPersistenceError = nil
+            markPersistenceSucceeded(at: Date())
             onDidPersist?()
         } catch {
-            lastPersistenceError = error.localizedDescription
-            displayState = .stopped
+            setPersistenceError(error.localizedDescription)
+            setDisplayState(.stopped)
         }
+    }
+
+    private func setDisplayState(_ newValue: MonitorDisplayState) {
+        guard displayState != newValue else { return }
+        displayState = newValue
+    }
+
+    private func markPersistenceSucceeded(at date: Date) {
+        if lastPersistenceError != nil { lastPersistenceError = nil }
+        if lastRecordedAt == nil || date.timeIntervalSince(lastRecordedAt ?? .distantPast) >= 60 {
+            lastRecordedAt = date
+        }
+    }
+
+    private func setPersistenceError(_ message: String) {
+        guard lastPersistenceError != message else { return }
+        lastPersistenceError = message
     }
 
     private func splitAtMidnightIfNeeded(now: Date) async {
@@ -404,12 +451,16 @@ final class ActivityMonitor: NSObject, ObservableObject, @unchecked Sendable {
 private func microcamAccessibilityCallback(
     _: AXObserver,
     _: AXUIElement,
-    _: CFString,
+    notification: CFString,
     refcon: UnsafeMutableRawPointer?
 ) {
     guard let refcon else { return }
     let monitor = Unmanaged<ActivityMonitor>.fromOpaque(refcon).takeUnretainedValue()
+    let focusedWindowChanged = CFEqual(
+        notification,
+        kAXFocusedWindowChangedNotification as CFString
+    )
     Task { @MainActor in
-        await monitor.accessibilityEventReceived()
+        await monitor.accessibilityEventReceived(focusedWindowChanged: focusedWindowChanged)
     }
 }

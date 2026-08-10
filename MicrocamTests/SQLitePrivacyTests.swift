@@ -93,6 +93,12 @@ import Testing
         let summaries = try await store.fetchActivityDaySummaries(calendar: calendar, now: now)
         #expect(summaries.count == 1)
         #expect(summaries.first?.activeSeconds == 900.0)
+        let singleDaySummary = try await store.fetchActivityDaySummary(
+            forDay: "2026-08-08",
+            calendar: calendar,
+            now: now
+        )
+        #expect(singleDaySummary?.activeSeconds == 900.0)
 
         do {
             _ = try await store.fetchSegments(forDay: "2026-08-08", calendar: calendar)
@@ -192,5 +198,61 @@ import Testing
 
         #expect(try await store.fetchSegments(from: oldDate, to: cutoff).isEmpty)
         #expect(try await store.diary(for: "2026-07-01")?.content == "永久保留")
+    }
+
+    @Test func detailedActivityLoadsInBoundedNewestFirstPages() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("microcam-pagination-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try SQLiteStore(
+            cryptoBox: .ephemeral(),
+            databaseURL: directory.appendingPathComponent("test.sqlite")
+        )
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "Asia/Shanghai"))
+        let start = try #require(ISO8601DateFormatter().date(from: "2026-08-08T08:00:00+08:00"))
+
+        for index in 0..<120 {
+            let segmentStart = start.addingTimeInterval(TimeInterval(index * 60))
+            try await store.save(ActivitySegment(
+                id: UUID(),
+                startAt: segmentStart,
+                endAt: segmentStart.addingTimeInterval(30),
+                bundleID: "com.example.editor",
+                appName: "Editor",
+                sanitizedTitle: "title-\(index)",
+                capturePolicy: .title
+            ))
+        }
+
+        let first = try await store.fetchSegmentPage(
+            forDay: "2026-08-08",
+            limit: 50,
+            calendar: calendar
+        )
+        let second = try await store.fetchSegmentPage(
+            forDay: "2026-08-08",
+            offset: first.nextOffset,
+            limit: 50,
+            calendar: calendar
+        )
+        let third = try await store.fetchSegmentPage(
+            forDay: "2026-08-08",
+            offset: second.nextOffset,
+            limit: 50,
+            calendar: calendar
+        )
+
+        #expect(first.segments.count == 50)
+        #expect(first.segments.first?.sanitizedTitle == "title-119")
+        #expect(first.hasMore)
+        #expect(second.segments.count == 50)
+        #expect(second.segments.first?.sanitizedTitle == "title-69")
+        #expect(second.hasMore)
+        #expect(third.segments.count == 20)
+        #expect(third.segments.last?.sanitizedTitle == "title-0")
+        #expect(!third.hasMore)
+        #expect(Set((first.segments + second.segments + third.segments).map(\.id)).count == 120)
     }
 }

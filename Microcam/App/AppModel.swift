@@ -15,14 +15,19 @@ final class AppModel: ObservableObject {
     @Published private(set) var isGenerating = false
     @Published private(set) var generatingDay: String?
     @Published private(set) var operationMessage: String?
-    @Published private(set) var promptPreview = "暂无活动可预览"
     @Published private(set) var lastRefresh = Date()
 
     private let store: SQLiteStore
     private let diaryService: DiaryService
     private let aiClient = AIClient()
     private var started = false
-    private var lastAutomaticCheck: Date?
+    private var lastAutomaticEvaluationDay: String?
+    private var liveRefreshTask: Task<Void, Never>?
+    private var lastLiveRefresh = Date.distantPast
+
+    private static let liveRefreshInterval: TimeInterval = 120
+    private static let recentActivityLimit = 8
+    private static let promptPreviewCharacterLimit = 8_000
 
     private static var isRunningTests: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
@@ -52,9 +57,12 @@ final class AppModel: ObservableObject {
         }
 
         monitor.onDidPersist = { [weak self] in
-            Task { @MainActor [weak self] in await self?.refreshToday() }
+            self?.scheduleLiveRefresh()
         }
         monitor.onWake = { [weak self] in
+            Task { @MainActor [weak self] in await self?.checkAutomaticDiaryGeneration(force: true) }
+        }
+        monitor.onPeriodicMaintenance = { [weak self] in
             Task { @MainActor [weak self] in await self?.checkAutomaticDiaryGeneration() }
         }
 
@@ -66,7 +74,7 @@ final class AppModel: ObservableObject {
     }
 
     var todayActiveSeconds: TimeInterval {
-        todaySegments.reduce(0) { $0 + $1.activeSeconds }
+        activityDays.first(where: { $0.isToday })?.activeSeconds ?? 0
     }
 
     var knownApplications: [(bundleID: String, name: String)] {
@@ -105,6 +113,7 @@ final class AppModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        lastLiveRefresh = Date()
         await monitor.start()
         await cleanupExpiredActivity()
         await refreshAll()
@@ -112,10 +121,13 @@ final class AppModel: ObservableObject {
     }
 
     func shutdown() async {
+        liveRefreshTask?.cancel()
+        liveRefreshTask = nil
         await monitor.stop()
     }
 
     func refreshAll() async {
+        cancelScheduledLiveRefresh()
         await refreshActivityDays()
         await refreshToday()
         await refreshDiaries()
@@ -123,6 +135,7 @@ final class AppModel: ObservableObject {
     }
 
     func refreshActivityData() async {
+        cancelScheduledLiveRefresh()
         await refreshActivityDays()
         await refreshToday()
     }
@@ -140,14 +153,21 @@ final class AppModel: ObservableObject {
         let day = DateCoding.dayString(Date())
         let crossedMidnight = activityDays.contains { $0.isToday && $0.day != day }
         do {
-            todaySegments = try await store.fetchSegments(forDay: day)
+            let recentPage = try await store.fetchSegmentPage(
+                forDay: day,
+                limit: Self.recentActivityLimit
+            )
+            let todaySummary = try await store.fetchActivityDaySummary(forDay: day)
+            // Keep only the rows displayed by the overview. Detailed history is loaded
+            // separately in bounded pages when the user opens the activity panel.
+            todaySegments = Array(recentPage.segments.reversed())
             if crossedMidnight {
                 activityDays = try await store.fetchActivityDaySummaries()
             } else {
-                patchTodaySummary()
+                patchTodaySummary(todaySummary)
             }
             lastRefresh = Date()
-            updatePromptPreview()
+            lastLiveRefresh = lastRefresh
         } catch {
             operationMessage = error.localizedDescription
         }
@@ -161,8 +181,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func activitySegments(forDay day: String) async throws -> [ActivitySegment] {
-        try await store.fetchSegments(forDay: day)
+    func activitySegmentPage(
+        forDay day: String,
+        offset: Int = 0,
+        limit: Int = 50
+    ) async throws -> ActivitySegmentPage {
+        try await store.fetchSegmentPage(forDay: day, offset: offset, limit: limit)
     }
 
     func generateDiary(forDay day: String, replacingExisting: Bool = false, automatic: Bool = false) async {
@@ -230,7 +254,6 @@ final class AppModel: ObservableObject {
         } catch {
             operationMessage = error.localizedDescription
         }
-        updatePromptPreview()
     }
 
     func deleteAllActivities() async {
@@ -317,8 +340,28 @@ final class AppModel: ObservableObject {
         settings.redactor.redact(value) ?? "（脱敏后为空）"
     }
 
-    func refreshPromptPreview() {
-        updatePromptPreview()
+    func savePromptTemplate(_ template: String) {
+        settings.promptTemplate = template
+        operationMessage = "提示词已保存"
+    }
+
+    func renderPromptPreview(template: String) async throws -> String {
+        guard template.contains("{{activity_summary}}") else {
+            throw PromptRendererError.missingActivitySummary
+        }
+
+        let now = Date()
+        let day = DateCoding.dayString(now)
+        let segments = try await store.fetchSegments(forDay: day)
+        let rendered = try await Task.detached(priority: .userInitiated) {
+            let payload = DiaryAggregator.aggregate(segments: segments, date: now)
+            return try PromptRenderer.render(template: template, payload: payload)
+        }.value
+        if rendered.count > Self.promptPreviewCharacterLimit {
+            return String(rendered.prefix(Self.promptPreviewCharacterLimit))
+                + "\n\n[界面预览已截断；实际生成仍会使用完整聚合摘要]"
+        }
+        return rendered
     }
 
     func dismissOperationMessage() {
@@ -339,7 +382,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func checkAutomaticDiaryGeneration() async {
+    private func checkAutomaticDiaryGeneration(force: Bool = false) async {
         guard
             settings.autoGenerate,
             settings.aiDataSharingConfirmed,
@@ -348,14 +391,15 @@ final class AppModel: ObservableObject {
         else { return }
         let calendar = Calendar.autoupdatingCurrent
         let now = Date()
-        if let lastAutomaticCheck, now.timeIntervalSince(lastAutomaticCheck) < 60 { return }
-        lastAutomaticCheck = now
+        let evaluationDay = DateCoding.dayString(now, calendar: calendar)
+        if !force, lastAutomaticEvaluationDay == evaluationDay { return }
         let startOfToday = calendar.startOfDay(for: now)
         var scheduleComponents = DateComponents()
         scheduleComponents.hour = settings.generationHour
         scheduleComponents.minute = settings.generationMinute
         let todaySchedule = calendar.date(byAdding: scheduleComponents, to: startOfToday) ?? startOfToday
         guard now >= todaySchedule else { return }
+        lastAutomaticEvaluationDay = evaluationDay
 
         await refreshActivityDays()
         let diaryByDay = Dictionary(uniqueKeysWithValues: diaries.map { ($0.day, $0) })
@@ -371,27 +415,30 @@ final class AppModel: ObservableObject {
         await generateDiary(forDay: day, automatic: true)
     }
 
-    private func updatePromptPreview() {
-        let payload = DiaryAggregator.aggregate(segments: todaySegments, date: Date())
-        promptPreview = (try? PromptRenderer.render(template: settings.promptTemplate, payload: payload))
-            ?? settings.promptValidationMessage
-            ?? "无法生成预览"
+    private func scheduleLiveRefresh() {
+        guard started, liveRefreshTask == nil else { return }
+        let delay = max(0, Self.liveRefreshInterval - Date().timeIntervalSince(lastLiveRefresh))
+        liveRefreshTask = Task { @MainActor [weak self] in
+            if delay > 0 {
+                do {
+                    try await Task.sleep(for: .seconds(delay))
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled, let self else { return }
+            liveRefreshTask = nil
+            await refreshToday()
+        }
     }
 
-    private func patchTodaySummary() {
-        let calendar = Calendar.autoupdatingCurrent
-        let now = Date()
-        let today = DateCoding.dayString(now, calendar: calendar)
-        let record = todaySegments.map {
-            ActivityIntervalRecord(
-                startAt: $0.startAt,
-                endAt: $0.endAt,
-                bundleID: $0.bundleID,
-                appName: $0.appName
-            )
-        }
-        let todaySummary = ActivityDayAggregator.summarize(record, calendar: calendar, now: now).first
+    private func cancelScheduledLiveRefresh() {
+        liveRefreshTask?.cancel()
+        liveRefreshTask = nil
+    }
 
+    private func patchTodaySummary(_ todaySummary: ActivityDaySummary?) {
+        let today = DateCoding.dayString(Date())
         var updated = activityDays.filter { $0.day != today }.map { summary in
             ActivityDaySummary(
                 day: summary.day,

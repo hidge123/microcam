@@ -112,32 +112,7 @@ actor SQLiteStore {
 
         var segments: [ActivitySegment] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            guard
-                let idValue = columnString(statement, 0),
-                let id = UUID(uuidString: idValue),
-                let bundleID = columnString(statement, 3),
-                let appName = columnString(statement, 4),
-                let policyValue = columnString(statement, 6),
-                let policy = AppCapturePolicy(rawValue: policyValue)
-            else { continue }
-
-            let encryptedTitle = columnData(statement, 5)
-            let title: String?
-            do {
-                title = try cryptoBox.open(encryptedTitle)
-            } catch {
-                throw SQLiteStoreError.corruptedEncryptedField
-            }
-
-            segments.append(ActivitySegment(
-                id: id,
-                startAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
-                endAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
-                bundleID: bundleID,
-                appName: appName,
-                sanitizedTitle: title,
-                capturePolicy: policy
-            ))
+            if let segment = try decodeSegment(statement) { segments.append(segment) }
         }
         return segments
     }
@@ -172,6 +147,43 @@ actor SQLiteStore {
         return ActivityDayAggregator.summarize(records, calendar: calendar, now: now)
     }
 
+    func fetchActivityDaySummary(
+        forDay day: String,
+        calendar: Calendar = .autoupdatingCurrent,
+        now: Date = Date()
+    ) throws -> ActivityDaySummary? {
+        guard
+            let date = DateCoding.date(fromDay: day, calendar: calendar),
+            let interval = calendar.dateInterval(of: .day, for: date)
+        else { return nil }
+
+        let statement = try prepare("""
+        SELECT start_at, end_at, bundle_id, app_name
+        FROM activity_segments
+        WHERE end_at > ? AND start_at < ? AND end_at > start_at
+        ORDER BY start_at ASC;
+        """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, interval.start.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 2, interval.end.timeIntervalSince1970)
+
+        var records: [ActivityIntervalRecord] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard
+                let bundleID = columnString(statement, 2),
+                let appName = columnString(statement, 3)
+            else { continue }
+            records.append(ActivityIntervalRecord(
+                startAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 0)),
+                endAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                bundleID: bundleID,
+                appName: appName
+            ))
+        }
+        return ActivityDayAggregator.summarize(records, calendar: calendar, now: now)
+            .first(where: { $0.day == day })
+    }
+
     func fetchSegments(
         forDay day: String,
         calendar: Calendar = .autoupdatingCurrent
@@ -195,6 +207,64 @@ actor SQLiteStore {
                 capturePolicy: segment.capturePolicy
             )
         }
+    }
+
+    func fetchSegmentPage(
+        forDay day: String,
+        offset: Int = 0,
+        limit: Int = 50,
+        calendar: Calendar = .autoupdatingCurrent
+    ) throws -> ActivitySegmentPage {
+        guard
+            let date = DateCoding.date(fromDay: day, calendar: calendar),
+            let interval = calendar.dateInterval(of: .day, for: date)
+        else { return ActivitySegmentPage(segments: [], nextOffset: 0, hasMore: false) }
+
+        let boundedOffset = max(0, offset)
+        let boundedLimit = min(max(1, limit), 200)
+        let statement = try prepare("""
+        SELECT id, start_at, end_at, bundle_id, app_name, title_ciphertext, capture_policy
+        FROM activity_segments
+        WHERE end_at > ? AND start_at < ?
+        ORDER BY start_at DESC, id DESC
+        LIMIT ? OFFSET ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, interval.start.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 2, interval.end.timeIntervalSince1970)
+        // Read one extra row to determine whether another page exists. Its encrypted
+        // title is deliberately never copied or decrypted.
+        sqlite3_bind_int(statement, 3, Int32(boundedLimit + 1))
+        sqlite3_bind_int64(statement, 4, sqlite3_int64(boundedOffset))
+
+        var segments: [ActivitySegment] = []
+        var hasMore = false
+        var rowsConsumed = 0
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if rowsConsumed == boundedLimit {
+                hasMore = true
+                break
+            }
+            rowsConsumed += 1
+            guard let segment = try decodeSegment(statement) else { continue }
+            let clippedStart = max(segment.startAt, interval.start)
+            let clippedEnd = min(segment.endAt, interval.end)
+            guard clippedEnd > clippedStart else { continue }
+            segments.append(ActivitySegment(
+                id: segment.id,
+                startAt: clippedStart,
+                endAt: clippedEnd,
+                bundleID: segment.bundleID,
+                appName: segment.appName,
+                sanitizedTitle: segment.sanitizedTitle,
+                capturePolicy: segment.capturePolicy
+            ))
+        }
+        return ActivitySegmentPage(
+            segments: segments,
+            nextOffset: boundedOffset + rowsConsumed,
+            hasMore: hasMore
+        )
     }
 
     func save(_ diary: DiaryEntry) throws {
@@ -455,6 +525,33 @@ actor SQLiteStore {
     private func columnData(_ statement: OpaquePointer?, _ index: Int32) -> Data? {
         guard let bytes = sqlite3_column_blob(statement, index) else { return nil }
         return Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, index)))
+    }
+
+    private func decodeSegment(_ statement: OpaquePointer?) throws -> ActivitySegment? {
+        guard
+            let idValue = columnString(statement, 0),
+            let id = UUID(uuidString: idValue),
+            let bundleID = columnString(statement, 3),
+            let appName = columnString(statement, 4),
+            let policyValue = columnString(statement, 6),
+            let policy = AppCapturePolicy(rawValue: policyValue)
+        else { return nil }
+
+        let title: String?
+        do {
+            title = try cryptoBox.open(columnData(statement, 5))
+        } catch {
+            throw SQLiteStoreError.corruptedEncryptedField
+        }
+        return ActivitySegment(
+            id: id,
+            startAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+            endAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
+            bundleID: bundleID,
+            appName: appName,
+            sanitizedTitle: title,
+            capturePolicy: policy
+        )
     }
 }
 
