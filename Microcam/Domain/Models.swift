@@ -223,3 +223,45 @@ enum DateCoding {
         return date
     }
 }
+
+enum AutomaticDiarySchedule {
+    static func dueDate(
+        forActivityDay day: String,
+        generationHour: Int,
+        generationMinute: Int,
+        calendar: Calendar = .autoupdatingCurrent
+    ) -> Date? {
+        guard
+            let activityDate = DateCoding.date(fromDay: day, calendar: calendar),
+            let followingDay = calendar.date(byAdding: .day, value: 1, to: activityDate)
+        else { return nil }
+
+        var components = DateComponents()
+        components.hour = min(max(generationHour, 0), 23)
+        components.minute = min(max(generationMinute, 0), 59)
+        components.second = 0
+        return calendar.nextDate(
+            after: followingDay.addingTimeInterval(-1),
+            matching: components,
+            matchingPolicy: .nextTime,
+            repeatedTimePolicy: .first,
+            direction: .forward
+        )
+    }
+
+    static func isDue(
+        activityDay day: String,
+        at date: Date,
+        generationHour: Int,
+        generationMinute: Int,
+        calendar: Calendar = .autoupdatingCurrent
+    ) -> Bool {
+        guard let dueDate = dueDate(
+            forActivityDay: day,
+            generationHour: generationHour,
+            generationMinute: generationMinute,
+            calendar: calendar
+        ) else { return false }
+        return date >= dueDate
+    }
+}

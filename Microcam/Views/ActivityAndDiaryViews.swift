@@ -284,12 +284,18 @@ struct ActivityView: View {
 
 struct DiariesView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject private var settings: SettingsStore
     @State private var selectedDay: String?
     @State private var showingReplaceConfirmation = false
     @State private var showingDeleteConfirmation = false
 
     private var selectedRecord: DiaryDayRecord? {
         model.diaryRecords.first { $0.day == selectedDay }
+    }
+
+    init(model: AppModel) {
+        self.model = model
+        settings = model.settings
     }
 
     var body: some View {
@@ -463,6 +469,13 @@ struct DiariesView: View {
                     ? "没有可用于生成日记的来源数据。"
                     : "已有日记会继续保留，但无法重新生成。",
                 symbol: "archivebox",
+                tint: .orange
+            )
+        } else if record.diary == nil, let reason = model.automaticDiaryGenerationBlockReason {
+            StatusBanner(
+                title: "自动生成暂不可用",
+                detail: "\(reason)。仍可使用右上角按钮手动生成。",
+                symbol: "exclamationmark.triangle",
                 tint: .orange
             )
         } else if record.diary == nil {

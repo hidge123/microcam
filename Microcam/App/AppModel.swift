@@ -21,7 +21,6 @@ final class AppModel: ObservableObject {
     private let diaryService: DiaryService
     private let aiClient = AIClient()
     private var started = false
-    private var lastAutomaticEvaluationDay: String?
     private var liveRefreshTask: Task<Void, Never>?
     private var lastLiveRefresh = Date.distantPast
 
@@ -108,6 +107,22 @@ final class AppModel: ObservableObject {
         let todaySchedule = calendar.date(byAdding: components, to: start) ?? start
         if todaySchedule > now { return todaySchedule }
         return calendar.date(byAdding: .day, value: 1, to: todaySchedule) ?? todaySchedule
+    }
+
+    var automaticDiaryGenerationBlockReason: String? {
+        if !settings.autoGenerate {
+            return "自动生成已关闭，可在“设置 → 通用”中启用"
+        }
+        if !settings.aiDataSharingConfirmed {
+            return "请在“设置 → AI”中确认脱敏活动摘要的发送目标"
+        }
+        if !settings.aiConfiguration.isConfigured {
+            return "AI 接口尚未配置完整"
+        }
+        if let promptValidationMessage = settings.promptValidationMessage {
+            return promptValidationMessage
+        }
+        return nil
     }
 
     func start() async {
@@ -383,36 +398,64 @@ final class AppModel: ObservableObject {
     }
 
     private func checkAutomaticDiaryGeneration(force: Bool = false) async {
-        guard
-            settings.autoGenerate,
-            settings.aiDataSharingConfirmed,
-            settings.aiConfiguration.isConfigured,
-            !isGenerating
-        else { return }
+        guard !isGenerating else { return }
+
+        if force {
+            // Sleep/wake notifications can arrive after hours of suspension, and a debug
+            // process may instead be relaunched after the wake event. Refresh both sources
+            // before deciding whether an overdue activity day needs catch-up generation.
+            await refreshActivityDays()
+            await refreshDiaries()
+        }
+
         let calendar = Calendar.autoupdatingCurrent
         let now = Date()
-        let evaluationDay = DateCoding.dayString(now, calendar: calendar)
-        if !force, lastAutomaticEvaluationDay == evaluationDay { return }
-        let startOfToday = calendar.startOfDay(for: now)
-        var scheduleComponents = DateComponents()
-        scheduleComponents.hour = settings.generationHour
-        scheduleComponents.minute = settings.generationMinute
-        let todaySchedule = calendar.date(byAdding: scheduleComponents, to: startOfToday) ?? startOfToday
-        guard now >= todaySchedule else { return }
-        lastAutomaticEvaluationDay = evaluationDay
+        guard var candidate = automaticDiaryCandidate(at: now, calendar: calendar) else { return }
 
-        await refreshActivityDays()
-        let diaryByDay = Dictionary(uniqueKeysWithValues: diaries.map { ($0.day, $0) })
-        guard let candidate = activityDays.first(where: { summary in
-            guard !summary.isToday, summary.startAt < startOfToday else { return false }
-            let status = diaryByDay[summary.day]?.status
-            return status != .succeeded && status != .pending
-        }) else { return }
-        let day = candidate.day
-        guard !settings.hasAutoAttempted(day: day) else { return }
+        if let reason = automaticDiaryGenerationBlockReason {
+            let message = "未能自动补生成 \(candidate.day) 的日记：\(reason)"
+            if operationMessage != message {
+                operationMessage = message
+            }
+            return
+        }
 
-        settings.markAutoAttempt(for: day)
-        await generateDiary(forDay: day, automatic: true)
+        if !force {
+            // The in-memory lists are sufficient for the cheap once-per-minute eligibility
+            // check. Hit SQLite only after a due candidate exists, then confirm it still
+            // has activity and no diary state before starting a billable request.
+            await refreshActivityDays()
+            await refreshDiaries()
+            guard let refreshedCandidate = automaticDiaryCandidate(at: now, calendar: calendar) else {
+                return
+            }
+            candidate = refreshedCandidate
+        }
+
+        await generateDiary(forDay: candidate.day, automatic: true)
+    }
+
+    private func automaticDiaryCandidate(
+        at date: Date,
+        calendar: Calendar
+    ) -> ActivityDaySummary? {
+        // Any persisted diary state is authoritative. In particular, pending prevents a
+        // duplicate request after a crash, and failed requires an explicit manual retry.
+        let diaryDays = Set(diaries.map(\.day))
+        return activityDays.first { summary in
+            guard
+                !summary.isToday,
+                summary.activeSeconds > 0,
+                !diaryDays.contains(summary.day)
+            else { return false }
+            return AutomaticDiarySchedule.isDue(
+                activityDay: summary.day,
+                at: date,
+                generationHour: settings.generationHour,
+                generationMinute: settings.generationMinute,
+                calendar: calendar
+            )
+        }
     }
 
     private func scheduleLiveRefresh() {

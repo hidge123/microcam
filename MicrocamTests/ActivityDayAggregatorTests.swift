@@ -106,6 +106,58 @@ import Testing
         #expect(!expired.canGenerate)
     }
 
+    @Test func activityDayBecomesDueAtFollowingDaySchedule() throws {
+        let calendar = try calendar(timeZone: "Asia/Shanghai")
+
+        #expect(!AutomaticDiarySchedule.isDue(
+            activityDay: "2026-08-09",
+            at: try date("2026-08-10T00:04:59+08:00"),
+            generationHour: 0,
+            generationMinute: 5,
+            calendar: calendar
+        ))
+        #expect(AutomaticDiarySchedule.isDue(
+            activityDay: "2026-08-09",
+            at: try date("2026-08-10T00:05:00+08:00"),
+            generationHour: 0,
+            generationMinute: 5,
+            calendar: calendar
+        ))
+    }
+
+    @Test func overdueOlderDayIsDueBeforeTodaysConfiguredTime() throws {
+        let calendar = try calendar(timeZone: "Asia/Shanghai")
+        let morning = try date("2026-08-10T09:00:00+08:00")
+
+        #expect(AutomaticDiarySchedule.isDue(
+            activityDay: "2026-08-08",
+            at: morning,
+            generationHour: 23,
+            generationMinute: 0,
+            calendar: calendar
+        ))
+        #expect(!AutomaticDiarySchedule.isDue(
+            activityDay: "2026-08-09",
+            at: morning,
+            generationHour: 23,
+            generationMinute: 0,
+            calendar: calendar
+        ))
+    }
+
+    @Test func missingDSTTimeAdvancesWithinFollowingCalendarDay() throws {
+        let calendar = try calendar(timeZone: "America/Los_Angeles")
+        let dueDate = try #require(AutomaticDiarySchedule.dueDate(
+            forActivityDay: "2026-03-07",
+            generationHour: 2,
+            generationMinute: 30,
+            calendar: calendar
+        ))
+
+        #expect(DateCoding.dayString(dueDate, calendar: calendar) == "2026-03-08")
+        #expect(calendar.component(.hour, from: dueDate) >= 3)
+    }
+
     private func calendar(timeZone identifier: String) throws -> Calendar {
         var value = Calendar(identifier: .gregorian)
         value.timeZone = try #require(TimeZone(identifier: identifier))
