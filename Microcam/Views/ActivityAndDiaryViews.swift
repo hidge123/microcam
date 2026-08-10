@@ -288,6 +288,7 @@ struct DiariesView: View {
     @State private var selectedDay: String?
     @State private var showingReplaceConfirmation = false
     @State private var showingDeleteConfirmation = false
+    @State private var contentDisplayMode: DiaryContentDisplayMode = .preview
 
     private var selectedRecord: DiaryDayRecord? {
         model.diaryRecords.first { $0.day == selectedDay }
@@ -413,10 +414,29 @@ struct DiariesView: View {
 
                     if let diary = record.diary, let content = diary.content {
                         Divider()
-                        Text(LocalizedStringKey(content))
-                            .textSelection(.enabled)
-                            .font(.body)
-                            .lineSpacing(5)
+                        HStack {
+                            Text("日记正文").font(.headline)
+                            Spacer()
+                            Picker("正文显示方式", selection: $contentDisplayMode) {
+                                ForEach(DiaryContentDisplayMode.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(width: 180)
+                        }
+
+                        switch contentDisplayMode {
+                        case .preview:
+                            DiaryMarkdownView(markdown: content)
+                        case .source:
+                            Text(content)
+                                .font(.system(.body, design: .monospaced))
+                                .lineSpacing(4)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
                     } else {
                         diaryEmptyState(for: record)
                     }
@@ -540,6 +560,136 @@ struct DiariesView: View {
             self.selectedDay = model.diaryRecords.first?.day
             return
         }
+    }
+}
+
+private enum DiaryContentDisplayMode: String, CaseIterable, Identifiable {
+    case preview = "渲染预览"
+    case source = "原始文本"
+
+    var id: Self { self }
+}
+
+private struct DiaryMarkdownView: View {
+    let blocks: [DiaryMarkdownBlock]
+
+    init(markdown: String) {
+        blocks = DiaryMarkdownParser.parse(markdown)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: DiaryMarkdownBlock) -> some View {
+        switch block {
+        case let .heading(level, text):
+            InlineMarkdownText(text)
+                .font(headingFont(level: level))
+                .padding(.top, level <= 2 ? 6 : 2)
+
+        case let .paragraph(text):
+            InlineMarkdownText(text)
+                .font(.body)
+                .lineSpacing(5)
+
+        case let .blockquote(text):
+            HStack(alignment: .top, spacing: 12) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.accentColor.opacity(0.55))
+                    .frame(width: 4)
+                InlineMarkdownText(text)
+                    .foregroundStyle(.secondary)
+                    .italic()
+                    .lineSpacing(4)
+            }
+            .padding(.vertical, 3)
+
+        case let .unorderedListItem(text, depth, checked):
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                if let checked {
+                    Image(systemName: checked ? "checkmark.square.fill" : "square")
+                        .foregroundStyle(checked ? Color.accentColor : .secondary)
+                        .frame(width: 14)
+                } else {
+                    Circle()
+                        .fill(Color.secondary)
+                        .frame(width: 5, height: 5)
+                        .frame(width: 14)
+                }
+                InlineMarkdownText(text)
+                    .lineSpacing(3)
+            }
+            .padding(.leading, CGFloat(depth) * 18)
+
+        case let .orderedListItem(number, text, depth):
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("\(number).")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .frame(minWidth: 20, alignment: .trailing)
+                InlineMarkdownText(text)
+                    .lineSpacing(3)
+            }
+            .padding(.leading, CGFloat(depth) * 18)
+
+        case let .codeBlock(language, code):
+            VStack(alignment: .leading, spacing: 8) {
+                if let language {
+                    Text(language)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                ScrollView(.horizontal) {
+                    Text(code)
+                        .font(.system(.callout, design: .monospaced))
+                        .lineSpacing(3)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
+
+        case .thematicBreak:
+            Divider().padding(.vertical, 4)
+        }
+    }
+
+    private func headingFont(level: Int) -> Font {
+        switch level {
+        case 1: .title.bold()
+        case 2: .title2.bold()
+        case 3: .title3.bold()
+        default: .headline.bold()
+        }
+    }
+}
+
+private struct InlineMarkdownText: View {
+    let value: AttributedString
+
+    init(_ markdown: String) {
+        value = (try? AttributedString(
+            markdown: markdown,
+            options: .init(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace,
+                failurePolicy: .returnPartiallyParsedIfPossible
+            )
+        )) ?? AttributedString(markdown)
+    }
+
+    var body: some View {
+        Text(value)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
