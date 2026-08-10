@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerMonitor, safeStorage, Tray } from "electron";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { CryptoBox } from "../core/crypto-box.js";
 import { SecureStore } from "./secure-store.js";
 import { SettingsStore } from "./settings-store.js";
@@ -87,7 +87,14 @@ function createWindow() {
       sandbox: true
     }
   });
-  mainWindow.loadFile(path.join(moduleDirectory, "..", "renderer", "index.html"));
+  const rendererURL = pathToFileURL(path.join(moduleDirectory, "..", "renderer", "index.html")).href;
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (url !== rendererURL) event.preventDefault();
+  });
+  mainWindow.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  mainWindow.loadURL(rendererURL);
   mainWindow.on("close", (event) => {
     if (!quitting) {
       event.preventDefault();

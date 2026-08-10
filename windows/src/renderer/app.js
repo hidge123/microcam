@@ -220,6 +220,7 @@ async function saveSettings() {
 
 async function runAction(operation) {
   try { await operation(); } catch (error) { window.alert(error.message); }
+  settingsDirty = false;
   await refresh();
 }
 

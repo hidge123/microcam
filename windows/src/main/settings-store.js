@@ -49,16 +49,20 @@ export class SettingsStore {
     if (typeof patch?.promptTemplate === "string" && !patch.promptTemplate.includes("{{activity_summary}}")) {
       throw new Error("提示词必须包含 {{activity_summary}}");
     }
-    if (Object.hasOwn(patch ?? {}, "apiKey")) this.secureStore.set("ai-api-key", patch.apiKey);
+    let redactionRules = null;
     if (Object.hasOwn(patch ?? {}, "customSensitiveTerms") || Object.hasOwn(patch ?? {}, "customPatterns")) {
       const current = this.#readRedactionRules();
       const terms = normalizeLines(patch.customSensitiveTerms ?? current.terms);
       const patterns = normalizeLines(patch.customPatterns ?? current.patterns);
       const errors = validateCustomPatterns(patterns);
       if (errors.length) throw new Error(errors[0]);
-      this.secureStore.set("redaction-rules", JSON.stringify({ terms, patterns }));
+      redactionRules = { terms, patterns };
     }
-    this.value = normalizeSettings(next);
+    const normalized = normalizeSettings(next);
+    // Validate every field before mutating either secure storage or settings on disk.
+    if (Object.hasOwn(patch ?? {}, "apiKey")) this.secureStore.set("ai-api-key", patch.apiKey);
+    if (redactionRules) this.secureStore.set("redaction-rules", JSON.stringify(redactionRules));
+    this.value = normalized;
     this.#write();
     return this.snapshot();
   }
