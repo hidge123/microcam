@@ -1,0 +1,73 @@
+{
+  "name": "microcam-windows",
+  "version": "0.3.0",
+  "description": "Privacy-first Windows activity diary",
+  "main": "src/main/index.js",
+  "type": "module",
+  "private": true,
+  "author": "Microcam contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "lint": "node scripts/check.mjs",
+    "dist:win": "electron-builder --win --x64 --arm64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "43.2.0",
+    "electron-builder": "26.15.7"
+  },
+  "build": {
+    "appId": "com.hidge123.microcam",
+    "productName": "Microcam",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../Microcam/Assets.xcassets/AppIcon.appiconset/appicon-256.png",
+        "to": "assets/icon.png"
+      },
+      {
+        "from": "src/platform/win32-monitor.ps1",
+        "to": "platform/win32-monitor.ps1"
+      }
+    ],
+    "win": {
+      "icon": "../Microcam/Assets.xcassets/AppIcon.appiconset/appicon-256.png",
+      "signExecutable": false,
+      "forceCodeSigning": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64", "arm64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64", "arm64"]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "Microcam-${version}-${arch}-Setup.${ext}",
+      "buildUniversalInstaller": false,
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "Microcam-${version}-${arch}-Portable.${ext}",
+      "buildUniversalInstaller": false
+    }
+  }
+}
