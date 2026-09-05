@@ -1,6 +1,10 @@
 .DS_Store
 DerivedData/
 build/
+node_modules/
+dist/
+coverage/
+npm-debug.log*
 *.xcuserstate
 xcuserdata/
 *.xccheckout

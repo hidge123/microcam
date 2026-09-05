@@ -1,0 +1,49 @@
+name: Release Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  signed-release:
+    runs-on: windows-latest
+    environment: windows-release
+    defaults:
+      run:
+        working-directory: windows
+    env:
+      WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+      WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: windows/package-lock.json
+      - name: Require Authenticode identity
+        shell: powershell
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WIN_CSC_LINK) -or [string]::IsNullOrWhiteSpace($env:WIN_CSC_KEY_PASSWORD)) {
+            throw "Windows signing identity is missing; refusing to publish an unsigned release."
+          }
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+      - name: Build signed packages
+        run: npx electron-builder --win --x64 --arm64 --publish never --config.win.signExecutable=true --config.win.forceCodeSigning=true
+      - name: Publish GitHub Release
+        shell: powershell
+        run: |
+          $artifacts = Get-ChildItem .\dist\*.exe | ForEach-Object { $_.FullName }
+          gh release create "${{ inputs.tag }}" $artifacts --verify-tag --generate-notes --title "Microcam ${{ inputs.tag }}"
