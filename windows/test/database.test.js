@@ -27,9 +27,11 @@ test("database stores private fields as ciphertext", () => {
 
 test("deleting one day preserves portions of a legacy cross-midnight segment", (context) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "microcam-delete-test-"));
-  context.after(() => rmSync(directory, { recursive: true, force: true }));
   const database = new MicrocamDatabase(path.join(directory, "microcam.sqlite"), new CryptoBox(Buffer.alloc(32, 4)));
-  context.after(() => database.close());
+  context.after(() => {
+    database.close();
+    rmSync(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  });
   database.saveSegment(database.createSegment({
     startAt: new Date(2026, 7, 7, 23, 50).getTime(),
     endAt: new Date(2026, 7, 9, 0, 10).getTime(),
